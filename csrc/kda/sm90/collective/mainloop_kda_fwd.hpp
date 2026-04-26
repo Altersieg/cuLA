@@ -48,6 +48,8 @@ struct KdaNamedBarriers : FlatSharedNamedBarriers {
     // used for subchunk MMA with two groups, each group has 2 warps
     // static constexpr int AuxMathWarp0 = FlatSharedNamedBarriers::NumBarriersUsed + 3;
     // static constexpr int AuxMathWarp1 = FlatSharedNamedBarriers::NumBarriersUsed + 4;
+    // barrier for l2norm partial sum exchange between WG0 and WG1
+    static constexpr int NormExchange = FlatSharedNamedBarriers::NumBarriersUsed + 3;
 };
 
 using ku::alignment_for_swizzle;
@@ -443,6 +445,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         cute::array_aligned<ElementBeta, cute::cosize_v<SmemLayoutBeta>> smem_beta;
         // store last row in Alpha separately, used for S'=K^T NewV's epilogue and S+=decay(S') (one fused epilogue)
         cute::array_aligned<ElementAlpha, cute::cosize_v<SmemLayoutAlphaLast>> smem_alpha_last;
+        // l2norm: per-row partial sum of squares, exchanged between WG0 and WG1
+        // layout: [2 (WG0/WG1), max_tokens (64), 2 (Q/K)]
+        // WG0 writes its partial ||q||^2 for head_dim[0:64), WG1 writes for head_dim[64:128)
+        alignas(16) float smem_norm_partial[2][64][2];
     };
 
     using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
@@ -1040,6 +1046,91 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
                     auto tArA = make_fragment_like<ElementAlpha>(tQKrQ_wg);
 
+#if FLAT_DEBUG_PRINT
+                    // DEBUG: print TV layout mapping for l2norm reduction design
+                    if (blk == 1 && wg_idx == 0 && thread_idx_in_wg < 4) {
+                        for (int i = 0; i < size(tQcMq_quar); ++i) {
+                            auto coord = tQcMq_quar(i);
+                            printf("TV_MAP wg=%d thr=%d frag[%d] -> (row=%d, col=%d)\n",
+                                   wg_idx, thread_idx_in_wg, i,
+                                   int(get<0>(coord)), int(get<1>(coord)));
+                        }
+                    }
+#endif
+
+                    // ========================================================
+                    // L2Norm Phase 1: Accumulate per-row sum of squares
+                    // Each WG processes its half of head_dim (WG0: [0:64), WG1: [64:128))
+                    // and writes partial ||q||^2, ||k||^2 to smem_norm_partial[wg_idx][row][0/1]
+                    // ========================================================
+
+                    // Zero-init this WG's SMEM norm accumulators
+                    // 64 rows × 2 (Q/K) = 128 floats, 256 threads total → some threads idle
+                    for (int i = thread_idx; i < 128; i += NumStateMmaThreads) {
+                        int row = i / 2, qk = i % 2;
+                        storage.smem_norm_partial[wg_idx][row][qk] = 0.0f;
+                    }
+                    // Barrier: ensure zero-init visible to all threads before accumulation
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumStateMmaThreads, KdaNamedBarriers::NormExchange);
+
+                    // Accumulate squares: iterate over 2 slices of 32 head_dim each
+                    for (int s = 0; s < 2; ++s) {
+                        // S2R Q for this slice
+                        auto sQqk_cur = sQqk_slice(_, _, _0{}, make_coord(s, wg_idx));
+                        auto tQKsQ_cur = thr_load_qk_quar.partition_S(sQqk_cur);
+                        auto tQKrQ_cv = thr_load_qk_quar.retile_D(tQKrQ_wg);
+                        copy(tiled_load_qk_quar, tQKsQ_cur, tQKrQ_cv);
+
+                        // Per-element: accumulate q^2 to SMEM by row
+                        for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
+                            int row = int(get<0>(tQcMq_quar(i)));
+                            float v = float(tQKrQ_wg(i));
+                            atomicAdd(&storage.smem_norm_partial[wg_idx][row][0], v * v);
+                        });
+
+                        // S2R K for this slice
+                        auto sKqk_cur = sKqk_slice(_, _, _0{}, make_coord(s, wg_idx));
+                        auto tQKsK_cur = thr_load_qk_quar.partition_S(sKqk_cur);
+                        auto tQKrK_cv = thr_load_qk_quar.retile_D(tQKrK_wg);
+                        copy(tiled_load_qk_quar, tQKsK_cur, tQKrK_cv);
+
+                        // Per-element: accumulate k^2 to SMEM by row
+                        for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
+                            int row = int(get<0>(tQcMq_quar(i)));
+                            float v = float(tQKrK_wg(i));
+                            atomicAdd(&storage.smem_norm_partial[wg_idx][row][1], v * v);
+                        });
+                    }
+
+                    // ========================================================
+                    // L2Norm Phase 2: Exchange partial sums, compute rsqrt
+                    // WG0 has ||q[0:64)||^2, WG1 has ||q[64:128)||^2
+                    // Sum them to get full ||q||^2, then rsqrt
+                    // ========================================================
+
+                    // Barrier: ensure all threads finished accumulation
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumStateMmaThreads, KdaNamedBarriers::NormExchange);
+
+                    // Compute rsqrt: one thread per (row, Q/K) pair
+                    // Reuse smem_norm_partial[0][row][qk] to store final rsqrt
+                    constexpr float kNormEps = 1e-6f;
+                    for (int i = thread_idx; i < 128; i += NumStateMmaThreads) {
+                        int row = i / 2, qk = i % 2;
+                        float sq_sum = storage.smem_norm_partial[0][row][qk]
+                                     + storage.smem_norm_partial[1][row][qk];
+                        storage.smem_norm_partial[0][row][qk] = rsqrtf(sq_sum + kNormEps);
+                    }
+
+                    // Barrier: ensure rsqrt results are visible before use
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumStateMmaThreads, KdaNamedBarriers::NormExchange);
+
+                    // ========================================================
+                    // Original prologue (modified): exp(alpha) * Q * norm_scale
+                    // ========================================================
+
                     for (int s = 0; s < 2; ++s) {
                         // S2R Alpha: alpha_col = wg_idx * 2 + s
                         int alpha_col = alpha_base + s;
@@ -1055,10 +1146,13 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         auto tQKrQ_cv = thr_load_qk_quar.retile_D(tQKrQ_wg);
                         copy(tiled_load_qk_quar, tQKsQ_cur, tQKrQ_cv);
 
-                        // element-wise exp(alpha) * Q
-                        cute::transform(tQKrQ_wg, tArA, tQKrQ_wg, [&](auto q, auto alpha) {
-                            Element dst = Element(alpha * float(q));
-                            return dst;
+                        // element-wise exp(alpha) * Q * norm_scale_q
+                        for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
+                            int row = int(get<0>(tQcMq_quar(i)));
+                            float norm_s = storage.smem_norm_partial[0][row][0];
+                            float q_f = float(tQKrQ_wg(i));
+                            float alpha_f = tArA(i);
+                            tQKrQ_wg(i) = Element(alpha_f * q_f * norm_s);
                         });
 
                         // R2S Q -> stage 0
@@ -1073,10 +1167,13 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         auto tQKrK_cv = thr_load_qk_quar.retile_D(tQKrK_wg);
                         copy(tiled_load_qk_quar, tQKsK_cur, tQKrK_cv);
 
-                        // element-wise exp(alpha) * K
-                        cute::transform(tQKrK_wg, tArA, tQKrK_wg, [&](auto k, auto alpha) {
-                            Element dst = Element(alpha * float(k));
-                            return dst;
+                        // element-wise exp(alpha) * K * norm_scale_k
+                        for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
+                            int row = int(get<0>(tQcMq_quar(i)));
+                            float norm_s = storage.smem_norm_partial[0][row][1];
+                            float k_f = float(tQKrK_wg(i));
+                            float alpha_f = tArA(i);
+                            tQKrK_wg(i) = Element(alpha_f * k_f * norm_s);
                         });
 
                         // R2S K -> stage 1
