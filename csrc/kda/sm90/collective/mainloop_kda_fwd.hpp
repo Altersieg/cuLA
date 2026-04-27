@@ -1682,7 +1682,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 for_each(make_int_sequence<size(tA_coord_bf16)>{}, [&](auto i) {
                     int local_row = int(get<0>(tA_coord_bf16(i)));
                     int global_row = int(r_) * 16 + local_row;
-                    float norm_q = storage.smem_norm_partial[global_row][0];
+                    float norm_q = 1.0f; // storage.smem_norm_partial[global_row][0]; // DEBUG: force 1.0
+                    (void)global_row;
                     tQKrQ_r_j_float(i) = float(tQKrQ_r_j_bf16(i)) * tArA_r_j(i) * norm_q;
                 });
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
@@ -1700,7 +1701,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 for_each(make_int_sequence<size(tA_coord_bf16)>{}, [&](auto i) {
                     int local_row = int(get<0>(tA_coord_bf16(i)));
                     int global_row = int(r_) * 16 + local_row;
-                    float norm_k = storage.smem_norm_partial[global_row][1];
+                    float norm_k = 1.0f; // storage.smem_norm_partial[global_row][1]; // DEBUG: force 1.0
+                    (void)global_row;
                     tQKrK_r_j_float(i) = float(tQKrK_r_j_bf16(i)) * tArA_r_j(i) * norm_k;
                 });
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
@@ -1740,7 +1742,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     for_each(make_int_sequence<size(tB_coord_bf16)>{}, [&](auto i) {
                         int local_token = int(get<0>(tB_coord_bf16(i)));
                         int global_token = int(c_) * 16 + local_token;
-                        float norm_k = storage.smem_norm_partial[global_token][1];
+                        float norm_k = 1.0f; // storage.smem_norm_partial[global_token][1]; // DEBUG: force 1.0
+                        (void)global_token;
                         tQKrKt_c_j_float(i) = float(tQKrKt_c_j_bf16(i)) * tArA_c_j(i) * norm_k;
                     });
 
