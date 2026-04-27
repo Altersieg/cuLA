@@ -85,8 +85,12 @@ class HopperChunkKDAFunction(torch.autograd.Function):
 
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
-            q, q_rstd = l2norm_fwd(q)
-            k, k_rstd = l2norm_fwd(k)
+            # NOTE: l2norm now fused into C++ kernel prologue (debug/l2norm-fusion)
+            # External l2norm_fwd disabled to validate fused implementation.
+            # TODO: revert if fusion fails correctness, or add a flag to switch
+            # q, q_rstd = l2norm_fwd(q)
+            # k, k_rstd = l2norm_fwd(k)
+            pass
 
         # reshape to packed [T, H, K] for the C++ kernel
         packed_seq = batch_size * seq_len
