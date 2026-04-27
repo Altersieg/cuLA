@@ -140,11 +140,6 @@ launch_kda_fwd_prefill_kernel_gbai(
             throw std::runtime_error("can_implement failed");
         }
 
-        // Print kernel resource usage for debugging
-        using KernelType = typename decltype(op)::GemmKernel;
-        printf("[KDA DEBUG] SharedStorageSize = %zu bytes\n", sizeof(typename KernelType::SharedStorage));
-        printf("[KDA DEBUG] MaxThreadsPerBlock = %d\n", KernelType::MaxThreadsPerBlock);
-
         status = op.initialize(arguments, workspace_buffer, stream);
         if (status != cutlass::Status::kSuccess) {
             cudaError_t cuda_err = cudaGetLastError();
