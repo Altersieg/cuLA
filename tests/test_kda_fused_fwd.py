@@ -149,19 +149,6 @@ def test_safe_gate_chunk(
         transpose_state_layout=True,
     )
 
-    # DEBUG: print expected norm values for comparison with kernel output
-    if use_qk_l2norm_in_kernel:
-        q_flat = q.reshape(-1, H, D)  # [B*T, H, D]
-        k_flat = k.reshape(-1, H, D)
-        # blk=1 → tokens 64..127 for head 0 of batch 0
-        for r in range(4):
-            row = 64 + r
-            q_row = q_flat[row, 0, :].float()
-            k_row = k_flat[row, 0, :].float()
-            q_rstd = 1.0 / (q_row.norm() ** 2 + 1e-6).sqrt()
-            k_rstd = 1.0 / (k_row.norm() ** 2 + 1e-6).sqrt()
-            print(f"EXPECTED blk=1 row={r} q_rstd={q_rstd.item():.6f} k_rstd={k_rstd.item():.6f}")
-
     tri, tri_ht = cula_kda_fused_fwd(
         q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
         k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),

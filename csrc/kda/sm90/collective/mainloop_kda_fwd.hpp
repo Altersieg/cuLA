@@ -1089,14 +1089,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 cutlass::arch::NamedBarrier::arrive_and_wait(
                     NumStateMmaThreads, KdaNamedBarriers::NormExchange);
 
-                // DEBUG: verify norm values (one CTA only)
-                if (blk == 1 && thread_idx == 0 && seq_idx == 0 && q_head_idx == 0) {
-                    for (int r = 0; r < 4; r++) {
-                        printf("NORM blk=%d row=%d q_rstd=%f k_rstd=%f\n",
-                               blk, r, storage.smem_norm_partial[r][0], storage.smem_norm_partial[r][1]);
-                    }
-                }
-
                 // Cross-WG sync: signal MathA that norms are ready
                 cutlass::arch::fence_view_async_shared();
                 cutlass::arch::NamedBarrier::arrive_and_wait(
@@ -1604,17 +1596,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             auto tv_layout_bf16_mma_A = tQKrQ_bf16_1_0.layout();
             auto tv_layout_bf16_mma_B = tQKrKt_bf16_1_0.layout();
 
-            // DEBUG: verify BF16 MMA operand A row mapping against (idx%4<2) assumption
-            if (blk == 1 && local_thread_idx == 0 && seq_idx == 0 && q_head_idx == 0) {
-                auto cA_dbg = make_identity_tensor(make_shape(_16{}, _32{}));
-                auto tAcA_dbg = thr_mma_bf16_subchunk.partition_A(cA_dbg);
-                for (int idx = 0; idx < size(tAcA_dbg); ++idx) {
-                    int actual_row = int(get<0>(tAcA_dbg(idx)));
-                    bool assumed_lo = (idx % 4) < 2;
-                    printf("FRAG_A idx=%d actual_row=%d assumed=%s g_norm=%d\n",
-                           idx, actual_row, assumed_lo ? "lo" : "hi", g_norm);
-                }
-            }
+            // Register-cached l2norm scales (filled after NormReady, avoids SMEM race with Math0/1's next-block zero-init)
+            // Operand A: 4 row tiles × {lo, hi} for Q and K
+            float cached_norm_q_lo[4], cached_norm_q_hi[4];
+            float cached_norm_k_lo[4], cached_norm_k_hi[4];
+            // Operand B: 4 col tiles for K^T
+            float cached_norm_kt[4];
 
             // S2R Q/K/G for operand A at row r, head dim slice j, and element-wise compute.
             // Loads alpha once in BF16 MMA layout, derives g_first via warp shuffle (8 shuffles,
@@ -1666,12 +1653,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 Tensor tQKrQ_r_j_float = make_fragment_like<float>(tv_layout_bf16_mma_A);
                 cute::transform(tQKrQ_r_j_bf16, tArA_r_j, tQKrQ_r_j_float,
                     [](auto q, auto a) { return float(q) * a; });
-                // apply per-row norm_scale_q using hardware TV mapping
+                // apply per-row norm_scale_q from register cache
                 {
-                    int row_lo = int(r_) * 16 + g_norm;
-                    int row_hi = int(r_) * 16 + g_norm + 8;
-                    float ns_lo = storage.smem_norm_partial[row_lo][0];
-                    float ns_hi = storage.smem_norm_partial[row_hi][0];
+                    float ns_lo = cached_norm_q_lo[int(r_)];
+                    float ns_hi = cached_norm_q_hi[int(r_)];
                     CUTE_UNROLL
                     for (int idx = 0; idx < size(tQKrQ_r_j_float); ++idx) {
                         tQKrQ_r_j_float(idx) *= (idx % 4 < 2) ? ns_lo : ns_hi;
@@ -1691,12 +1676,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 Tensor tQKrK_r_j_float = make_fragment_like<float>(tv_layout_bf16_mma_A);
                 cute::transform(tQKrK_r_j_bf16, tArA_r_j, tQKrK_r_j_float,
                     [](auto k, auto a) { return float(k) * a; });
-                // apply per-row norm_scale_k using hardware TV mapping
+                // apply per-row norm_scale_k from register cache
                 {
-                    int row_lo = int(r_) * 16 + g_norm;
-                    int row_hi = int(r_) * 16 + g_norm + 8;
-                    float ns_lo = storage.smem_norm_partial[row_lo][1];
-                    float ns_hi = storage.smem_norm_partial[row_hi][1];
+                    float ns_lo = cached_norm_k_lo[int(r_)];
+                    float ns_hi = cached_norm_k_hi[int(r_)];
                     CUTE_UNROLL
                     for (int idx = 0; idx < size(tQKrK_r_j_float); ++idx) {
                         tQKrK_r_j_float(idx) *= (idx % 4 < 2) ? ns_lo : ns_hi;
@@ -1738,10 +1721,9 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     Tensor tQKrKt_c_j_float = make_fragment_like<float>(tv_layout_bf16_mma_B);
                     cute::transform(tQKrKt_c_j_bf16, tArA_c_j, tQKrKt_c_j_float,
                         [](auto k, auto a) { return float(k) * a; });
-                    // apply norm_scale_k: for operand B, all elements belong to same token
+                    // apply norm_scale_k from register cache
                     {
-                        int global_token = int(c_) * 16 + warp_in_mma_norm * 8 + g_norm;
-                        float ns = storage.smem_norm_partial[global_token][1];
+                        float ns = cached_norm_kt[int(c_)];
                         CUTE_UNROLL
                         for (int idx = 0; idx < size(tQKrKt_c_j_float); ++idx) {
                             tQKrKt_c_j_float(idx) *= ns;
@@ -1799,6 +1781,16 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         cutlass::arch::NamedBarrier::arrive_and_wait(
                             NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
                         cutlass::arch::fence_view_async_shared();
+                        // Cache norms to registers (avoids SMEM race with Math0/1's next-block zero-init)
+                        for (int r = 0; r < 4; r++) {
+                            cached_norm_q_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][0];
+                            cached_norm_q_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][0];
+                            cached_norm_k_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][1];
+                            cached_norm_k_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][1];
+                        }
+                        for (int c = 0; c < 4; c++) {
+                            cached_norm_kt[c] = storage.smem_norm_partial[c * 16 + warp_in_mma_norm * 8 + g_norm][1];
+                        }
                     }
 
                     // for loop head dim
@@ -1971,6 +1963,16 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 cutlass::arch::NamedBarrier::arrive_and_wait(
                     NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
                 cutlass::arch::fence_view_async_shared();
+                // Cache norms to registers (avoids SMEM race with Math0/1's next-block zero-init)
+                for (int r = 0; r < 4; r++) {
+                    cached_norm_q_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][0];
+                    cached_norm_q_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][0];
+                    cached_norm_k_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][1];
+                    cached_norm_k_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][1];
+                }
+                for (int c = 0; c < 4; c++) {
+                    cached_norm_kt[c] = storage.smem_norm_partial[c * 16 + warp_in_mma_norm * 8 + g_norm][1];
+                }
 
                 // for loop head dim
                 CUTE_NO_UNROLL
