@@ -448,10 +448,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         cute::array_aligned<ElementBeta, cute::cosize_v<SmemLayoutBeta>> smem_beta;
         // store last row in Alpha separately, used for S'=K^T NewV's epilogue and S+=decay(S') (one fused epilogue)
         cute::array_aligned<ElementAlpha, cute::cosize_v<SmemLayoutAlphaLast>> smem_alpha_last;
-        // l2norm: per-row partial sum of squares, exchanged between WG0 and WG1
-        // layout: [2 (WG0/WG1), max_tokens (64), 2 (Q/K)]
-        // WG0 writes its partial ||q||^2 for head_dim[0:64), WG1 writes for head_dim[64:128)
-        alignas(16) float smem_norm_partial[2][64][2];
+        // l2norm: per-row sum of squares, shared by WG0 and WG1 via atomicAdd
+        // layout: [max_tokens (64), 2 (Q/K)]
+        // Both WGs atomicAdd their partial ||q||^2, ||k||^2 here
+        alignas(16) float smem_norm_partial[64][2];
     };
 
     using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
@@ -1064,14 +1064,14 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     // ========================================================
                     // L2Norm Phase 1: Accumulate per-row sum of squares
                     // Each WG processes its half of head_dim (WG0: [0:64), WG1: [64:128))
-                    // and writes partial ||q||^2, ||k||^2 to smem_norm_partial[wg_idx][row][0/1]
+                    // and atomicAdds partial ||q||^2, ||k||^2 to smem_norm_partial[row][0/1]
                     // ========================================================
 
-                    // Zero-init this WG's SMEM norm accumulators
+                    // Zero-init SMEM norm accumulators (shared by both WGs)
                     // 64 rows × 2 (Q/K) = 128 floats, 256 threads total → some threads idle
                     for (int i = thread_idx; i < 128; i += NumStateMmaThreads) {
                         int row = i / 2, qk = i % 2;
-                        storage.smem_norm_partial[wg_idx][row][qk] = 0.0f;
+                        storage.smem_norm_partial[row][qk] = 0.0f;
                     }
                     // Barrier: ensure zero-init visible to all threads before accumulation
                     cutlass::arch::NamedBarrier::arrive_and_wait(
@@ -1089,7 +1089,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
                             int row = int(get<0>(tQcMq_quar(i)));
                             float v = float(tQKrQ_wg(i));
-                            atomicAdd(&storage.smem_norm_partial[wg_idx][row][0], v * v);
+                            atomicAdd(&storage.smem_norm_partial[row][0], v * v);
                         });
 
                         // S2R K for this slice
@@ -1102,7 +1102,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
                             int row = int(get<0>(tQcMq_quar(i)));
                             float v = float(tQKrK_wg(i));
-                            atomicAdd(&storage.smem_norm_partial[wg_idx][row][1], v * v);
+                            atomicAdd(&storage.smem_norm_partial[row][1], v * v);
                         });
                     }
 
@@ -1117,20 +1117,19 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         NumStateMmaThreads, KdaNamedBarriers::NormExchange);
 
                     // Compute rsqrt: one thread per (row, Q/K) pair
-                    // Reuse smem_norm_partial[0][row][qk] to store final rsqrt
+                    // Both WGs already atomicAdd'd to the same buffer, so sum is complete
                     constexpr float kNormEps = 1e-6f;
                     for (int i = thread_idx; i < 128; i += NumStateMmaThreads) {
                         int row = i / 2, qk = i % 2;
-                        float sq_sum = storage.smem_norm_partial[0][row][qk]
-                                     + storage.smem_norm_partial[1][row][qk];
-                        storage.smem_norm_partial[0][row][qk] = rsqrtf(sq_sum + kNormEps);
+                        float sq_sum = storage.smem_norm_partial[row][qk];
+                        storage.smem_norm_partial[row][qk] = rsqrtf(sq_sum + kNormEps);
                     }
 
                     // Barrier: ensure rsqrt results are visible before use
                     cutlass::arch::NamedBarrier::arrive_and_wait(
                         NumStateMmaThreads, KdaNamedBarriers::NormExchange);
 
-                    // Sync with MathA: norm results in smem_norm_partial[0] are ready.
+                    // Sync with MathA: norm results in smem_norm_partial are ready.
                     // Must use arrive_and_wait (not just arrive) to prevent Math0/1 from
                     // looping to next chunk and corrupting the barrier count.
                     cutlass::arch::fence_view_async_shared();
@@ -1159,7 +1158,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         // element-wise exp(alpha) * Q * norm_scale_q
                         for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
                             int row = int(get<0>(tQcMq_quar(i)));
-                            float norm_s = storage.smem_norm_partial[0][row][0];
+                            float norm_s = storage.smem_norm_partial[row][0];
                             float q_f = float(tQKrQ_wg(i));
                             float alpha_f = tArA(i);
                             tQKrQ_wg(i) = Element(alpha_f * q_f * norm_s);
@@ -1180,7 +1179,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         // element-wise exp(alpha) * K * norm_scale_k
                         for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
                             int row = int(get<0>(tQcMq_quar(i)));
-                            float norm_s = storage.smem_norm_partial[0][row][1];
+                            float norm_s = storage.smem_norm_partial[row][1];
                             float k_f = float(tQKrK_wg(i));
                             float alpha_f = tArA(i);
                             tQKrK_wg(i) = Element(alpha_f * k_f * norm_s);
@@ -1587,7 +1586,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             auto tQKcMqk_subchunk = thr_mma_subchunk.partition_C(cMqk_subchunk);
 
             // Coordinate tensor for BF16 MMA operand A: maps fragment index → (row, head_dim)
-            // Used to look up per-row norm_scale from smem_norm_partial[0][global_row][qk]
+            // Used to look up per-row norm_scale from smem_norm_partial[global_row][qk]
             auto cA_bf16_subchunk = make_identity_tensor(Shape<_16, _32>{});
             auto tA_coord_bf16 = thr_mma_bf16_subchunk.partition_A(cA_bf16_subchunk);
             // Same for operand B: maps fragment index → (token, head_dim)
@@ -1683,7 +1682,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 for_each(make_int_sequence<size(tA_coord_bf16)>{}, [&](auto i) {
                     int local_row = int(get<0>(tA_coord_bf16(i)));
                     int global_row = int(r_) * 16 + local_row;
-                    float norm_q = storage.smem_norm_partial[0][global_row][0];
+                    float norm_q = storage.smem_norm_partial[global_row][0];
                     tQKrQ_r_j_float(i) = float(tQKrQ_r_j_bf16(i)) * tArA_r_j(i) * norm_q;
                 });
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
@@ -1701,7 +1700,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 for_each(make_int_sequence<size(tA_coord_bf16)>{}, [&](auto i) {
                     int local_row = int(get<0>(tA_coord_bf16(i)));
                     int global_row = int(r_) * 16 + local_row;
-                    float norm_k = storage.smem_norm_partial[0][global_row][1];
+                    float norm_k = storage.smem_norm_partial[global_row][1];
                     tQKrK_r_j_float(i) = float(tQKrK_r_j_bf16(i)) * tArA_r_j(i) * norm_k;
                 });
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
@@ -1741,7 +1740,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     for_each(make_int_sequence<size(tB_coord_bf16)>{}, [&](auto i) {
                         int local_token = int(get<0>(tB_coord_bf16(i)));
                         int global_token = int(c_) * 16 + local_token;
-                        float norm_k = storage.smem_norm_partial[0][global_token][1];
+                        float norm_k = storage.smem_norm_partial[global_token][1];
                         tQKrKt_c_j_float(i) = float(tQKrKt_c_j_bf16(i)) * tArA_c_j(i) * norm_k;
                     });
 
@@ -1792,7 +1791,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                             alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
                         }
                         // Wait for Math0/1 to finish l2norm computation
-                        // After this, smem_norm_partial[0][row][0/1] contains rsqrt(||q/k||^2 + eps)
+                        // After this, smem_norm_partial[row][0/1] contains rsqrt(||q/k||^2 + eps)
                         cutlass::arch::NamedBarrier::arrive_and_wait(
                             NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
                         cutlass::arch::fence_view_async_shared();
