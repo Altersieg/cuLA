@@ -140,9 +140,19 @@ launch_kda_fwd_prefill_kernel_gbai(
             throw std::runtime_error("can_implement failed");
         }
 
+        // Print kernel resource usage for debugging
+        using KernelType = typename decltype(op)::GemmKernel;
+        printf("[KDA DEBUG] SharedStorageSize = %zu bytes\n", sizeof(typename KernelType::SharedStorage));
+        printf("[KDA DEBUG] MaxThreadsPerBlock = %d\n", KernelType::MaxThreadsPerBlock);
+
         status = op.initialize(arguments, workspace_buffer, stream);
         if (status != cutlass::Status::kSuccess) {
-            throw std::runtime_error("initialize failed");
+            cudaError_t cuda_err = cudaGetLastError();
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                "initialize failed: cutlass status=%d, cuda error='%s' (%s)",
+                (int)status, cudaGetErrorName(cuda_err), cudaGetErrorString(cuda_err));
+            throw std::runtime_error(msg);
         }
 
         status = op.run(stream);
