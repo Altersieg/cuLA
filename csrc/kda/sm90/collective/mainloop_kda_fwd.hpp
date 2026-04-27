@@ -1597,7 +1597,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             auto tv_layout_bf16_mma_A = tQKrQ_bf16_1_0.layout();
             auto tv_layout_bf16_mma_B = tQKrKt_bf16_1_0.layout();
 
-            // Register-cached l2norm scales (filled after NormReady, avoids SMEM race with Math0/1's next-block zero-init)
+            // Register-cached l2norm scales: filled once after NormReady, reused across head-dim loop
+            // to avoid repeated SMEM loads inside s2r_compute lambdas.
             // Operand A: 4 row tiles × {lo, hi} for Q and K
             float cached_norm_q_lo[4], cached_norm_q_hi[4];
             float cached_norm_k_lo[4], cached_norm_k_hi[4];
@@ -1782,7 +1783,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         cutlass::arch::NamedBarrier::arrive_and_wait(
                             NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
                         cutlass::arch::fence_view_async_shared();
-                        // Cache norms to registers (avoids SMEM race with Math0/1's next-block zero-init)
+                        // Cache norms to registers: avoid repeated SMEM loads in head-dim loop
                         for (int r = 0; r < 4; r++) {
                             cached_norm_q_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][0];
                             cached_norm_q_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][0];
@@ -1964,7 +1965,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 cutlass::arch::NamedBarrier::arrive_and_wait(
                     NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
                 cutlass::arch::fence_view_async_shared();
-                // Cache norms to registers (avoids SMEM race with Math0/1's next-block zero-init)
+                // Cache norms to registers: avoid repeated SMEM loads in head-dim loop
                 for (int r = 0; r < 4; r++) {
                     cached_norm_q_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][0];
                     cached_norm_q_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][0];
