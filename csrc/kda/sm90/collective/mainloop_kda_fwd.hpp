@@ -1686,18 +1686,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     int row_hi = int(r_) * 16 + g_norm + 8;
                     float norm_q_lo = storage.smem_norm_partial[0][row_lo][0];
                     float norm_q_hi = storage.smem_norm_partial[0][row_hi][0];
-                    cute::transform(
-                        tQKrQ_r_j_bf16, tArA_r_j, tQKrQ_r_j_float,
-                        [&](auto q, auto g) { return float(q) * g; });
-                    // Apply per-row norm using known BF16 MMA A layout:
-                    // indices 4j+{0,1} → row_lo, 4j+{2,3} → row_hi
-                    CUTE_UNROLL
-                    for (int jj = 0; jj < 4; jj++) {
-                        tQKrQ_r_j_float(4*jj + 0) *= norm_q_lo;
-                        tQKrQ_r_j_float(4*jj + 1) *= norm_q_lo;
-                        tQKrQ_r_j_float(4*jj + 2) *= norm_q_hi;
-                        tQKrQ_r_j_float(4*jj + 3) *= norm_q_hi;
-                    }
+                    // BF16 m16n8k8 A layout: (i%4)<2 → row_lo, (i%4)>=2 → row_hi
+                    for_each(make_int_sequence<decltype(size(tQKrQ_r_j_float))::value>{}, [&](auto i) {
+                        float ns = (int(i) % 4 < 2) ? norm_q_lo : norm_q_hi;
+                        tQKrQ_r_j_float(i) = float(tQKrQ_r_j_bf16(i)) * tArA_r_j(i) * ns;
+                    });
                 }
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
                 convert_bf16_to_tf32_operandA_layout(tQKrQ_r_j_float, local_thread_idx);
@@ -1716,16 +1709,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     int row_hi = int(r_) * 16 + g_norm + 8;
                     float norm_k_lo = storage.smem_norm_partial[0][row_lo][1];
                     float norm_k_hi = storage.smem_norm_partial[0][row_hi][1];
-                    cute::transform(
-                        tQKrK_r_j_bf16, tArA_r_j, tQKrK_r_j_float,
-                        [&](auto k, auto g) { return float(k) * g; });
-                    CUTE_UNROLL
-                    for (int jj = 0; jj < 4; jj++) {
-                        tQKrK_r_j_float(4*jj + 0) *= norm_k_lo;
-                        tQKrK_r_j_float(4*jj + 1) *= norm_k_lo;
-                        tQKrK_r_j_float(4*jj + 2) *= norm_k_hi;
-                        tQKrK_r_j_float(4*jj + 3) *= norm_k_hi;
-                    }
+                    for_each(make_int_sequence<decltype(size(tQKrK_r_j_float))::value>{}, [&](auto i) {
+                        float ns = (int(i) % 4 < 2) ? norm_k_lo : norm_k_hi;
+                        tQKrK_r_j_float(i) = float(tQKrK_r_j_bf16(i)) * tArA_r_j(i) * ns;
+                    });
                 }
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
                 convert_bf16_to_tf32_operandA_layout(tQKrK_r_j_float, local_thread_idx);
