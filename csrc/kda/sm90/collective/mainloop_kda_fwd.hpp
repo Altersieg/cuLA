@@ -1037,57 +1037,69 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             // L2Norm: compute per-row rsqrt(||q||^2 + eps) and rsqrt(||k||^2 + eps)
             // Runs for ALL blocks (including first). Results in smem_norm_partial.
             // ========================================================
+            // --- ABLATION FLAGS (toggle to isolate regression cause) ---
+            // Test A: all false  → no norm code at all (should match main perf)
+            // Test B: only kDoNormBarrier=true → pure barrier stall cost
+            // Test C: kDoNormCompute=true, kDoNormBarrier=false → compute cost only
+            // Full:   all true → current behavior
+            constexpr bool kDoNormCompute = true;  // zero-init + atomicAdd + rsqrt
+            constexpr bool kDoNormBarrier = true;  // NormReady cross-WG barrier
+            constexpr bool kUseRealNorm = true;    // apply real norm vs 1.0f
             {
                 int wg_idx = thread_idx / 128;  // 0 or 1
                 auto tQKrQ_wg = qk_thr_mma_rs_quar.partition_fragment_A(sQqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
                 auto tQKrK_wg = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
 
-                // Zero-init SMEM norm accumulators
-                for (int i = thread_idx; i < 128; i += NumStateMmaThreads) {
-                    int row = i / 2, qk = i % 2;
-                    storage.smem_norm_partial[row][qk] = 0.0f;
+                if constexpr (kDoNormCompute) {
+                    // Zero-init SMEM norm accumulators
+                    for (int i = thread_idx; i < 128; i += NumStateMmaThreads) {
+                        int row = i / 2, qk = i % 2;
+                        storage.smem_norm_partial[row][qk] = 0.0f;
+                    }
+                    cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
+
+                    // Accumulate squares: 2 slices × 32 head_dim per WG
+                    for (int s = 0; s < 2; ++s) {
+                        auto sQqk_cur = sQqk_slice(_, _, _0{}, make_coord(s, wg_idx));
+                        auto tQKsQ_cur = thr_load_qk_quar.partition_S(sQqk_cur);
+                        auto tQKrQ_cv = thr_load_qk_quar.retile_D(tQKrQ_wg);
+                        copy(tiled_load_qk_quar, tQKsQ_cur, tQKrQ_cv);
+                        for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
+                            int row = int(get<0>(tQcMq_quar(i)));
+                            float v = float(tQKrQ_wg(i));
+                            atomicAdd(&storage.smem_norm_partial[row][0], v * v);
+                        });
+
+                        auto sKqk_cur = sKqk_slice(_, _, _0{}, make_coord(s, wg_idx));
+                        auto tQKsK_cur = thr_load_qk_quar.partition_S(sKqk_cur);
+                        auto tQKrK_cv = thr_load_qk_quar.retile_D(tQKrK_wg);
+                        copy(tiled_load_qk_quar, tQKsK_cur, tQKrK_cv);
+                        for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
+                            int row = int(get<0>(tQcMq_quar(i)));
+                            float v = float(tQKrK_wg(i));
+                            atomicAdd(&storage.smem_norm_partial[row][1], v * v);
+                        });
+                    }
+
+                    cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
+
+                    // Compute rsqrt
+                    constexpr float kNormEps = 1e-6f;
+                    for (int i = thread_idx; i < 128; i += NumStateMmaThreads) {
+                        int row = i / 2, qk = i % 2;
+                        float sq_sum = storage.smem_norm_partial[row][qk];
+                        storage.smem_norm_partial[row][qk] = rsqrtf(sq_sum + kNormEps);
+                    }
+
+                    cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
                 }
-                cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
 
-                // Accumulate squares: 2 slices × 32 head_dim per WG
-                for (int s = 0; s < 2; ++s) {
-                    auto sQqk_cur = sQqk_slice(_, _, _0{}, make_coord(s, wg_idx));
-                    auto tQKsQ_cur = thr_load_qk_quar.partition_S(sQqk_cur);
-                    auto tQKrQ_cv = thr_load_qk_quar.retile_D(tQKrQ_wg);
-                    copy(tiled_load_qk_quar, tQKsQ_cur, tQKrQ_cv);
-                    for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
-                        int row = int(get<0>(tQcMq_quar(i)));
-                        float v = float(tQKrQ_wg(i));
-                        atomicAdd(&storage.smem_norm_partial[row][0], v * v);
-                    });
-
-                    auto sKqk_cur = sKqk_slice(_, _, _0{}, make_coord(s, wg_idx));
-                    auto tQKsK_cur = thr_load_qk_quar.partition_S(sKqk_cur);
-                    auto tQKrK_cv = thr_load_qk_quar.retile_D(tQKrK_wg);
-                    copy(tiled_load_qk_quar, tQKsK_cur, tQKrK_cv);
-                    for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
-                        int row = int(get<0>(tQcMq_quar(i)));
-                        float v = float(tQKrK_wg(i));
-                        atomicAdd(&storage.smem_norm_partial[row][1], v * v);
-                    });
+                if constexpr (kDoNormBarrier) {
+                    // Cross-WG sync: signal MathA that norms are ready
+                    cutlass::arch::fence_view_async_shared();
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
                 }
-
-                cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
-
-                // Compute rsqrt
-                constexpr float kNormEps = 1e-6f;
-                for (int i = thread_idx; i < 128; i += NumStateMmaThreads) {
-                    int row = i / 2, qk = i % 2;
-                    float sq_sum = storage.smem_norm_partial[row][qk];
-                    storage.smem_norm_partial[row][qk] = rsqrtf(sq_sum + kNormEps);
-                }
-
-                cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
-
-                // Cross-WG sync: signal MathA that norms are ready
-                cutlass::arch::fence_view_async_shared();
-                cutlass::arch::NamedBarrier::arrive_and_wait(
-                    NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
             }
 
             // load alpha and exp2(alpha) only once
@@ -1123,7 +1135,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         // element-wise exp(alpha) * Q * norm_scale_q
                         for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
                             int row = int(get<0>(tQcMq_quar(i)));
-                            float norm_s = storage.smem_norm_partial[row][0];
+                            float norm_s = kUseRealNorm ? storage.smem_norm_partial[row][0] : 1.0f;
                             float q_f = float(tQKrQ_wg(i));
                             float alpha_f = tArA(i);
                             tQKrQ_wg(i) = Element(alpha_f * q_f * norm_s);
@@ -1144,7 +1156,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         // element-wise exp(alpha) * K * norm_scale_k
                         for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
                             int row = int(get<0>(tQcMq_quar(i)));
-                            float norm_s = storage.smem_norm_partial[row][1];
+                            float norm_s = kUseRealNorm ? storage.smem_norm_partial[row][1] : 1.0f;
                             float k_f = float(tQKrK_wg(i));
                             float alpha_f = tArA(i);
                             tQKrK_wg(i) = Element(alpha_f * k_f * norm_s);
@@ -1358,7 +1370,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         auto alpha = tArA_wg(i);
                         auto k = tQKrK_wg(i);
                         auto alpha_last = alpha_last_cur(t);
-                        float norm_s = storage.smem_norm_partial[int(seq)][1];
+                        float norm_s = kUseRealNorm ? storage.smem_norm_partial[int(seq)][1] : 1.0f;
                         auto k_scaled = Element(exp2f(alpha_last - alpha) * float(k) * norm_s);
                         tQKrK_wg(i) = k_scaled;
                         if constexpr (is_final_block) {
@@ -1771,20 +1783,32 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         if constexpr (NeedsAlpha) {
                             alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
                         }
-                        // Wait for Math0/1 to finish l2norm computation
-                        // After this, smem_norm_partial[row][0/1] contains rsqrt(||q/k||^2 + eps)
-                        cutlass::arch::NamedBarrier::arrive_and_wait(
-                            NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
-                        cutlass::arch::fence_view_async_shared();
-                        // Cache norms to registers: avoid repeated SMEM loads in head-dim loop
-                        for (int r = 0; r < 4; r++) {
-                            cached_norm_q_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][0];
-                            cached_norm_q_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][0];
-                            cached_norm_k_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][1];
-                            cached_norm_k_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][1];
+                        if constexpr (kDoNormBarrier) {
+                            // Wait for Math0/1 to finish l2norm computation
+                            cutlass::arch::NamedBarrier::arrive_and_wait(
+                                NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
+                            cutlass::arch::fence_view_async_shared();
                         }
-                        for (int c = 0; c < 4; c++) {
-                            cached_norm_kt[c] = storage.smem_norm_partial[c * 16 + warp_in_mma_norm * 8 + g_norm][1];
+                        if constexpr (kUseRealNorm) {
+                            // Cache norms to registers: avoid repeated SMEM loads in head-dim loop
+                            for (int r = 0; r < 4; r++) {
+                                cached_norm_q_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][0];
+                                cached_norm_q_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][0];
+                                cached_norm_k_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][1];
+                                cached_norm_k_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][1];
+                            }
+                            for (int c = 0; c < 4; c++) {
+                                cached_norm_kt[c] =
+                                    storage.smem_norm_partial[c * 16 + warp_in_mma_norm * 8 + g_norm][1];
+                            }
+                        } else {
+                            for (int r = 0; r < 4; r++) {
+                                cached_norm_q_lo[r] = cached_norm_q_hi[r] = 1.0f;
+                                cached_norm_k_lo[r] = cached_norm_k_hi[r] = 1.0f;
+                            }
+                            for (int c = 0; c < 4; c++) {
+                                cached_norm_kt[c] = 1.0f;
+                            }
                         }
                     }
 
@@ -1954,19 +1978,31 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 if constexpr (NeedsAlpha) {
                     alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
                 }
-                // Wait for Math0/1 to finish l2norm computation
-                cutlass::arch::NamedBarrier::arrive_and_wait(
-                    NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
-                cutlass::arch::fence_view_async_shared();
-                // Cache norms to registers: avoid repeated SMEM loads in head-dim loop
-                for (int r = 0; r < 4; r++) {
-                    cached_norm_q_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][0];
-                    cached_norm_q_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][0];
-                    cached_norm_k_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][1];
-                    cached_norm_k_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][1];
+                if constexpr (kDoNormBarrier) {
+                    // Wait for Math0/1 to finish l2norm computation
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
+                    cutlass::arch::fence_view_async_shared();
                 }
-                for (int c = 0; c < 4; c++) {
-                    cached_norm_kt[c] = storage.smem_norm_partial[c * 16 + warp_in_mma_norm * 8 + g_norm][1];
+                if constexpr (kUseRealNorm) {
+                    // Cache norms to registers: avoid repeated SMEM loads in head-dim loop
+                    for (int r = 0; r < 4; r++) {
+                        cached_norm_q_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][0];
+                        cached_norm_q_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][0];
+                        cached_norm_k_lo[r] = storage.smem_norm_partial[r * 16 + g_norm][1];
+                        cached_norm_k_hi[r] = storage.smem_norm_partial[r * 16 + g_norm + 8][1];
+                    }
+                    for (int c = 0; c < 4; c++) {
+                        cached_norm_kt[c] = storage.smem_norm_partial[c * 16 + warp_in_mma_norm * 8 + g_norm][1];
+                    }
+                } else {
+                    for (int r = 0; r < 4; r++) {
+                        cached_norm_q_lo[r] = cached_norm_q_hi[r] = 1.0f;
+                        cached_norm_k_lo[r] = cached_norm_k_hi[r] = 1.0f;
+                    }
+                    for (int c = 0; c < 4; c++) {
+                        cached_norm_kt[c] = 1.0f;
+                    }
                 }
 
                 // for loop head dim
