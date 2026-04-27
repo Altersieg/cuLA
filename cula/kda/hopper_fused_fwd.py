@@ -15,7 +15,6 @@
 
 import torch
 from einops import rearrange
-from fla.modules.l2norm import l2norm_fwd
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
@@ -83,13 +82,9 @@ class HopperChunkKDAFunction(torch.autograd.Function):
                 chunk_indices=chunk_indices,
             )
 
-        q_rstd, k_rstd = None, None
-        if use_qk_l2norm_in_kernel:
-            # l2norm fused into C++ kernel (both Math0/1 and MathA paths)
-            # External l2norm_fwd disabled for correctness validation.
-            # q, q_rstd = l2norm_fwd(q)
-            # k, k_rstd = l2norm_fwd(k)
-            pass
+        # l2norm is fused into the C++ kernel (Math0/1 prologue, MathA subchunk,
+        # and K state-update paths all apply rsqrt(||q/k||^2 + eps) per row).
+        # External l2norm_fwd is no longer needed when use_qk_l2norm_in_kernel=True.
 
         # reshape to packed [T, H, K] for the C++ kernel
         packed_seq = batch_size * seq_len
