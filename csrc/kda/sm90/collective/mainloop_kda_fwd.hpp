@@ -1604,6 +1604,18 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             auto tv_layout_bf16_mma_A = tQKrQ_bf16_1_0.layout();
             auto tv_layout_bf16_mma_B = tQKrKt_bf16_1_0.layout();
 
+            // DEBUG: verify BF16 MMA operand A row mapping against (idx%4<2) assumption
+            if (blk == 1 && local_thread_idx == 0 && seq_idx == 0 && q_head_idx == 0) {
+                auto cA_dbg = make_identity_tensor(make_shape(_16{}, _32{}));
+                auto tAcA_dbg = thr_mma_bf16_subchunk.partition_A(cA_dbg);
+                for (int idx = 0; idx < size(tAcA_dbg); ++idx) {
+                    int actual_row = int(get<0>(tAcA_dbg(idx)));
+                    bool assumed_lo = (idx % 4) < 2;
+                    printf("FRAG_A idx=%d actual_row=%d assumed=%s g_norm=%d\n",
+                           idx, actual_row, assumed_lo ? "lo" : "hi", g_norm);
+                }
+            }
+
             // S2R Q/K/G for operand A at row r, head dim slice j, and element-wise compute.
             // Loads alpha once in BF16 MMA layout, derives g_first via warp shuffle (8 shuffles,
             // replaces 1 S2R load), gates Q/K before the BF16→TF32 layout conversion.
