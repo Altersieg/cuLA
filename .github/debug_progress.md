@@ -20,86 +20,76 @@ Kernel 用 warp specialization 做软件流水线：
 Fused 之后：新增 `NormReady` cross-WG barrier → MathA 每个 block 都要等
 Math0/1 算完 norm → **流水线从并行变串行**。
 
-## 消融实验（已埋好开关）
+## 实测数据（H20，bench_no_fusion.log）
 
-文件: `csrc/kda/sm90/collective/mainloop_kda_fwd.hpp` ~L1015
+`B=1` fixed-length，no fusion vs with fusion：
 
-```cpp
-constexpr bool kDoNormCompute = ???;  // zero-init + atomicAdd + rsqrt
-constexpr bool kDoNormBarrier = ???;  // NormReady cross-WG barrier
-constexpr bool kUseRealNorm  = ???;   // apply real norm vs 1.0f
+| T | no fusion (ms) | with fusion (ms) | 退化 |
+|---|---|---|---|
+| 512 | 0.199 | 0.352 | 1.77x |
+| 1024 | 0.260 | 0.691 | 2.66x |
+| 4096 | 0.922 | 2.751 | **2.98x** |
+| 8192 | 1.799 | 5.494 | 3.05x |
+| 16384 | 3.574 | 10.903 | 3.05x |
+
+**关键规律**：退化随 T 增大收敛到 3x。小 T 退化小（block 少）、大 T 退化稳定在 3x。
+这是每 block 固定 barrier stall 的典型特征，**不需要消融实验即可确认 NormReady 是主因**。
+
+### 3x 的数学解释
+
+原流水线：Math0/1 和 MathA 并行，每 block ≈ α（以 Math0/1 为瓶颈）
+Fused 后：串行 = (norm 计算 β) + (Math0/1 剩余 α) + (MathA α)
+实测 3α → norm 计算 β ≈ α，norm 时间和一个完整 WG 的工作量相当。
+
+## 修复方向：各 WG 独立算 norm（消除 NormReady）
+
+**不能** Python 端预计算（等于退回 fusion 之前）。
+
+正确做法：Math0/1 和 MathA **各自独立计算 norm**，不需要跨 WG 同步：
+
+```
+Math0/1: sQqk/sKqk → 自己算 norm → 用于 prologue (exp(α)·Q·norm)
+MathA:   sQqk/sKqk → 自己算 norm → 用于 subchunk (q·norm in tensor cores)
+（两者读同一份 SMEM 数据，互不干扰，并行运行）
 ```
 
-| 实验 | Compute | Barrier | RealNorm | 目的 |
-|---|---|---|---|---|
-| A | false | false | false | 纯代码膨胀/reg 压力 |
-| B | false | true  | false | 纯 barrier 序列化开销 |
-| C | true  | false | false | 纯 atomicAdd + rsqrt 开销 |
-| Full | true | true | true | 当前完整实现 |
+代价：
+- norm 算两遍，但两 WG 并行 → 额外墙钟时间 ≈ 0
+- MathA 需要独立 SMEM buffer `smem_norm_aux[64][2]`（512 bytes）
+- 删掉 `NormReady` barrier 和 `NormExchange`（MathA 不用了）
 
-注意：改 flag **不影响正确性**（因为用 1.0f 代替 norm），只看性能。
-正确性验证用 Full。
+**预期效果**：恢复原流水线 overlap → 回到 no-fusion 性能。
 
-## 如何跑实验（H20）
+## 如何 pull（H20 有本地改动冲突）
 
 ```bash
-# 0. 拉最新代码
-cd ~/cuLA && git checkout debug/l2norm-fusion && git pull
-
-# 1. 切换到某个实验（以 Test A 为例）
-# 直接手编辑 L1015-1017 三行，或 sed 一把梭：
-sed -i '0,/kDoNormCompute = [a-z]*/s//kDoNormCompute = false/' \
-  csrc/kda/sm90/collective/mainloop_kda_fwd.hpp
-sed -i '0,/kDoNormBarrier = [a-z]*/s//kDoNormBarrier = false/' \
-  csrc/kda/sm90/collective/mainloop_kda_fwd.hpp
-sed -i '0,/kUseRealNorm = [a-z]*/s//kUseRealNorm = false/' \
-  csrc/kda/sm90/collective/mainloop_kda_fwd.hpp
-
-# 2. rebuild + bench
-rm -rf build
-python setup.py build_ext --inplace 2>&1 | tail -5
-python benchmarks/bench_kda_fused_fwd.py --mode fixed 2>&1 | tee bench_testA.log
-
-# 3. 重复 Test B/C/Full
+# H20 上丢弃本地改动（ablation 测试用的 flag 改动），拉最新
+cd ~/cuLA
+git checkout -- csrc/kda/sm90/collective/mainloop_kda_fwd.hpp
+git pull
 ```
-
-## 结果怎么看
-
-对比 `B=1 T=4096` 那一行的 `cuLA(ms)`（最稳定的退化点）：
-
-| 实验 | 预期 | 含义 |
-|---|---|---|
-| main | ~0.92 | 基线 |
-| A | ≈ main? | 若是 → 代码膨胀无影响 |
-| B | ≈ Full? | 若是 → **barrier 是主因** |
-| C | ≈ main? | 若是 → atomicAdd/rsqrt 开销不大 |
-| Full | ~2.74 | 当前 |
-
-**最可能**: A≈main, B≈Full, C≈main → 确认是 NormReady barrier 打断流水线。
-
-## 确认元凶后的修复方向
-
-若 barrier 是主因，fix 选项：
-1. **Python 端算 norm**（kernel 外预计算）→ 零 overhead，fusion 部分意义打折
-2. **MathA 自己算 norm**（从 SMEM 读 Q/K）→ 不跨 WG，但 MathA 多轮计算
-3. **Pipeline offset**（block N 的 MathA 用 block N-1 的 norm）→ 保持 overlap
 
 ## 已完成
 
 - [x] 正确性修复（K state 缺失的 norm_s）
-- [x] 消融开关埋点（推到 `debug/l2norm-fusion`）
-- [x] Flags 作用域修复（移到 compute_loop_body 之外）
+- [x] 根因确认（NormReady barrier 打断流水线，实测 3x 符合模型）
+- [x] 消融开关埋点（已推，但根据数据分析可跳过）
 
 ## 待办
 
-- [ ] H20 跑 A/B/C/Full 四组 bench，填表
-- [ ] 根据结果选择 fix 方向并实现
-- [ ] 重跑 bench 验证 ≤ main 性能
+- [ ] 实现修复：MathA 独立算 norm，删 NormReady（`mainloop_kda_fwd.hpp`）
+  - 加 `smem_norm_aux[64][2]` 到 SharedStorage
+  - `compute_aux_loop_body` 里加 norm 计算（warp reduce，不用 atomicAdd）
+  - 删 NormReady barrier 及 Math0/1 端的 arrive
+- [ ] 正确性测试：`pytest tests/test_kda_fused_fwd.py -k l2norm`
+- [ ] bench 验证：cuLA ≈ no-fusion 性能
+- [ ] 清理 ablation flags（恢复 kDoNormCompute=true 等，或整体删掉）
 - [ ] PR merge（`.github/pr_body.md` 已草稿）
 
 ## 相关文件
 
-- `csrc/kda/sm90/collective/mainloop_kda_fwd.hpp` — 主 kernel + ablation flags
+- `csrc/kda/sm90/collective/mainloop_kda_fwd.hpp` — 主 kernel
+- `csrc/kda/sm90/collective/mainloop_kda_fwd.hpp` ~L1015 — ablation flags（临时）
 - `.github/pr_body.md` — PR 正文草稿
 - `benchmarks/bench_kda_fused_fwd.py` — bench 脚本
 - `tests/test_kda_fused_fwd.py` — 正确性测试
