@@ -1354,7 +1354,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     auto tQKrK_cv = thr_load_qk_quar.retile_D(tQKrK_wg);
                     copy(tiled_load_qk_quar, tQKsK_cur, tQKrK_cv);
 
-                    // element-wise: exp(alpha_last - alpha) * K
+                    // element-wise: exp(alpha_last - alpha) * K * norm_scale_k
                     int alast_idx = alpha_base + s;
                     auto alpha_last_cur = sAlast_slice(_, alast_idx);
                     for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
@@ -1363,7 +1363,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         auto alpha = tArA_wg(i);
                         auto k = tQKrK_wg(i);
                         auto alpha_last = alpha_last_cur(t);
-                        auto k_scaled = Element(exp2f(alpha_last - alpha) * float(k));
+                        float norm_s = storage.smem_norm_partial[int(seq)][1];
+                        auto k_scaled = Element(exp2f(alpha_last - alpha) * float(k) * norm_s);
                         tQKrK_wg(i) = k_scaled;
                         if constexpr (is_final_block) {
                             if (seq >= B) {
