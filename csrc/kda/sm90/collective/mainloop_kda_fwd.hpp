@@ -48,11 +48,11 @@ struct KdaNamedBarriers : FlatSharedNamedBarriers {
     // used for subchunk MMA with two groups, each group has 2 warps
     // static constexpr int AuxMathWarp0 = FlatSharedNamedBarriers::NumBarriersUsed + 3;
     // static constexpr int AuxMathWarp1 = FlatSharedNamedBarriers::NumBarriersUsed + 4;
-    // barrier for l2norm partial sum exchange between WG0 and WG1
+    // barrier for l2norm: used for both intra-WG exchange (256 threads) and
+    // cross-WG sync (256+128=384 threads). Sequential uses with auto-reset.
+    // NOTE: cannot add more barriers — NormExchange at index 7 gives effective
+    // barrier ID 7+8=15, which is the SM90 hardware max.
     static constexpr int NormExchange = FlatSharedNamedBarriers::NumBarriersUsed + 3;
-    // barrier for Math0/1 to signal MathA that norm results are ready in SMEM
-    // participants: NumStateMmaThreads (256) + NumAuxMmaThreads (128) = 384
-    static constexpr int NormReady = FlatSharedNamedBarriers::NumBarriersUsed + 4;
 };
 
 using ku::alignment_for_swizzle;
@@ -1134,7 +1134,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     // looping to next chunk and corrupting the barrier count.
                     cutlass::arch::fence_view_async_shared();
                     cutlass::arch::NamedBarrier::arrive_and_wait(
-                        NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
+                        NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormExchange);
 
                     // ========================================================
                     // Original prologue (modified): exp(alpha) * Q * norm_scale
@@ -1813,7 +1813,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         // Only sync when Math0/1 actually computes l2norm (not on first block without input state)
                         if (blk > 0 || kInitStateFromInput) {
                             cutlass::arch::NamedBarrier::arrive_and_wait(
-                                NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
+                                NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormExchange);
                             cutlass::arch::fence_view_async_shared();
                         }
                     }
@@ -1988,7 +1988,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 // Only sync when Math0/1 actually computes l2norm (not on first block without input state)
                 if (blk > 0 || kInitStateFromInput) {
                     cutlass::arch::NamedBarrier::arrive_and_wait(
-                        NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
+                        NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormExchange);
                     cutlass::arch::fence_view_async_shared();
                 }
 
