@@ -140,13 +140,26 @@ launch_kda_fwd_prefill_kernel_gbai(
             throw std::runtime_error("can_implement failed");
         }
 
+        // Debug: print static kernel properties
+        using Kernel = typename kda::sm90::kernel::FlatBuilderKdaFwd<
+            T, float, float, TileShape,
+            cute::tuple<int64_t, _1, int32_t>, cute::tuple<int64_t, _1, int32_t>,
+            cute::tuple<int64_t, _1, int32_t>, cute::tuple<int64_t, _1, int32_t>,
+            Scheduler, Options>::Kernel;
+        printf("[KDA DEBUG] SharedStorageSize = %d bytes (%.1f KB)\n",
+               Kernel::SharedStorageSize, Kernel::SharedStorageSize / 1024.0);
+        printf("[KDA DEBUG] MaxThreadsPerBlock = %d\n", Kernel::MaxThreadsPerBlock);
+        // Clear any stale CUDA errors before initialize
+        cudaGetLastError();
         status = op.initialize(arguments, workspace_buffer, stream);
         if (status != cutlass::Status::kSuccess) {
             cudaError_t cuda_err = cudaGetLastError();
             char msg[512];
             snprintf(msg, sizeof(msg),
-                "initialize failed: cutlass status=%d, cuda error='%s' (%s)",
-                (int)status, cudaGetErrorName(cuda_err), cudaGetErrorString(cuda_err));
+                "initialize failed: cutlass status=%d, cuda error='%s' (%s), "
+                "smem=%d bytes",
+                (int)status, cudaGetErrorName(cuda_err), cudaGetErrorString(cuda_err),
+                Kernel::SharedStorageSize);
             throw std::runtime_error(msg);
         }
 
