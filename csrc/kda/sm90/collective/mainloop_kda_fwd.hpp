@@ -1688,8 +1688,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 {
                     int row_lo = int(r_) * 16 + g_norm;
                     int row_hi = int(r_) * 16 + g_norm + 8;
-                    float ns_lo = 1.0f; // storage.smem_norm_partial[row_lo][0]; // DEBUG
-                    float ns_hi = 1.0f; // storage.smem_norm_partial[row_hi][0]; // DEBUG
+                    float ns_lo = (blk > 0 || kInitStateFromInput) ? storage.smem_norm_partial[row_lo][0] : 1.0f;
+                    float ns_hi = (blk > 0 || kInitStateFromInput) ? storage.smem_norm_partial[row_hi][0] : 1.0f;
                     CUTE_UNROLL
                     for (int idx = 0; idx < size(tQKrQ_r_j_float); ++idx) {
                         tQKrQ_r_j_float(idx) *= (idx % 4 < 2) ? ns_lo : ns_hi;
@@ -1713,8 +1713,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 {
                     int row_lo = int(r_) * 16 + g_norm;
                     int row_hi = int(r_) * 16 + g_norm + 8;
-                    float ns_lo = 1.0f; // storage.smem_norm_partial[row_lo][1]; // DEBUG
-                    float ns_hi = 1.0f; // storage.smem_norm_partial[row_hi][1]; // DEBUG
+                    float ns_lo = (blk > 0 || kInitStateFromInput) ? storage.smem_norm_partial[row_lo][1] : 1.0f;
+                    float ns_hi = (blk > 0 || kInitStateFromInput) ? storage.smem_norm_partial[row_hi][1] : 1.0f;
                     CUTE_UNROLL
                     for (int idx = 0; idx < size(tQKrK_r_j_float); ++idx) {
                         tQKrK_r_j_float(idx) *= (idx % 4 < 2) ? ns_lo : ns_hi;
@@ -1759,7 +1759,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     // apply norm_scale_k: for operand B, all elements belong to same token
                     {
                         int global_token = int(c_) * 16 + warp_in_mma_norm * 8 + g_norm;
-                        float ns = 1.0f; // storage.smem_norm_partial[global_token][1]; // DEBUG
+                        float ns = (blk > 0 || kInitStateFromInput) ? storage.smem_norm_partial[global_token][1] : 1.0f;
                         CUTE_UNROLL
                         for (int idx = 0; idx < size(tQKrKt_c_j_float); ++idx) {
                             tQKrKt_c_j_float(idx) *= ns;
