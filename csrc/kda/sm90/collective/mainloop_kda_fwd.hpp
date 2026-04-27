@@ -1089,6 +1089,14 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 cutlass::arch::NamedBarrier::arrive_and_wait(
                     NumStateMmaThreads, KdaNamedBarriers::NormExchange);
 
+                // DEBUG: verify norm values (one CTA only)
+                if (blk == 1 && thread_idx == 0 && seq_idx == 0 && q_head_idx == 0) {
+                    for (int r = 0; r < 4; r++) {
+                        printf("NORM blk=%d row=%d q_rstd=%f k_rstd=%f\n",
+                               blk, r, storage.smem_norm_partial[r][0], storage.smem_norm_partial[r][1]);
+                    }
+                }
+
                 // Cross-WG sync: signal MathA that norms are ready
                 cutlass::arch::fence_view_async_shared();
                 cutlass::arch::NamedBarrier::arrive_and_wait(
