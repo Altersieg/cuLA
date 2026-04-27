@@ -1810,9 +1810,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         }
                         // Wait for Math0/1 to finish l2norm computation
                         // After this, smem_norm_partial[row][0/1] contains rsqrt(||q/k||^2 + eps)
-                        cutlass::arch::NamedBarrier::arrive_and_wait(
-                            NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
-                        cutlass::arch::fence_view_async_shared();
+                        // Only sync when Math0/1 actually computes l2norm (not on first block without input state)
+                        if (blk > 0 || kInitStateFromInput) {
+                            cutlass::arch::NamedBarrier::arrive_and_wait(
+                                NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
+                            cutlass::arch::fence_view_async_shared();
+                        }
                     }
 
                     // for loop head dim
@@ -1982,9 +1985,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
                 }
                 // Wait for Math0/1 to finish l2norm computation
-                cutlass::arch::NamedBarrier::arrive_and_wait(
-                    NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
-                cutlass::arch::fence_view_async_shared();
+                // Only sync when Math0/1 actually computes l2norm (not on first block without input state)
+                if (blk > 0 || kInitStateFromInput) {
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
+                    cutlass::arch::fence_view_async_shared();
+                }
 
                 // for loop head dim
                 CUTE_NO_UNROLL
