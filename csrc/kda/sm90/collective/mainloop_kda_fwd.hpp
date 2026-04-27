@@ -1007,6 +1007,15 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             }
         };
 
+        // --- ABLATION FLAGS (toggle to isolate regression cause) ---
+        // Test A: all false  → no norm code at all (should match main perf)
+        // Test B: only kDoNormBarrier=true → pure barrier stall cost
+        // Test C: kDoNormCompute=true, kDoNormBarrier=false → compute cost only
+        // Full:   all true → current behavior
+        constexpr bool kDoNormCompute = false;  // zero-init + atomicAdd + rsqrt
+        constexpr bool kDoNormBarrier = false;  // NormReady cross-WG barrier
+        constexpr bool kUseRealNorm = false;    // apply real norm vs 1.0f
+
         auto compute_loop_body = [&](int blk, auto is_first_block_, auto is_final_block_) INLINE_LAMBDA {
             constexpr bool is_first_block = decltype(is_first_block_)::value;
             constexpr bool is_final_block = decltype(is_final_block_)::value;
@@ -1037,14 +1046,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             // L2Norm: compute per-row rsqrt(||q||^2 + eps) and rsqrt(||k||^2 + eps)
             // Runs for ALL blocks (including first). Results in smem_norm_partial.
             // ========================================================
-            // --- ABLATION FLAGS (toggle to isolate regression cause) ---
-            // Test A: all false  → no norm code at all (should match main perf)
-            // Test B: only kDoNormBarrier=true → pure barrier stall cost
-            // Test C: kDoNormCompute=true, kDoNormBarrier=false → compute cost only
-            // Full:   all true → current behavior
-            constexpr bool kDoNormCompute = true;  // zero-init + atomicAdd + rsqrt
-            constexpr bool kDoNormBarrier = true;  // NormReady cross-WG barrier
-            constexpr bool kUseRealNorm = true;    // apply real norm vs 1.0f
             {
                 int wg_idx = thread_idx / 128;  // 0 or 1
                 auto tQKrQ_wg = qk_thr_mma_rs_quar.partition_fragment_A(sQqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
