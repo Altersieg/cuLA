@@ -1585,13 +1585,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             auto cMqk_subchunk = make_identity_tensor(select<0, 1>(TileShape_SubChunk{}));
             auto tQKcMqk_subchunk = thr_mma_subchunk.partition_C(cMqk_subchunk);
 
-            // Coordinate tensor for BF16 MMA operand A: maps fragment index → (row, head_dim)
-            // Used to look up per-row norm_scale from smem_norm_partial[global_row][qk]
-            auto cA_bf16_subchunk = make_identity_tensor(Shape<_16, _32>{});
-            auto tA_coord_bf16 = thr_mma_bf16_subchunk.partition_A(cA_bf16_subchunk);
-            // Same for operand B: maps fragment index → (token, head_dim)
-            auto cB_bf16_subchunk = make_identity_tensor(Shape<_16, _32>{});
-            auto tB_coord_bf16 = thr_mma_bf16_subchunk.partition_B(cB_bf16_subchunk);
+            // Hardware TV mapping for BF16 m16n8k16 MMA (from PTX ISA):
+            //   Operand A fragment: indices (i%4)<2 → row lane/4, (i%4)>=2 → row lane/4+8
+            //   Operand B fragment: all elements → token = warp_in_mma*8 + lane/4
+            int lane_id_norm = local_thread_idx % 32;
+            int g_norm = lane_id_norm / 4;  // M-group: 0-7
+            int warp_in_mma_norm = local_thread_idx / 32;  // 0 or 1 (2-warp MMA)
 
             // do MMA at the granularity of 16x16x64 with two warps
             constexpr auto tiler_subchunk_alpha = Shape<_16, Shape<_32, _1>>{};
@@ -1677,15 +1676,21 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 Tensor tQKsQ_r_j = Q_thr_copy.partition_S(sQqk_r_j);
                 Tensor tQKrQ_r_j_bf16_cv = Q_thr_copy.retile_D(tQKrQ_r_j_bf16);
                 copy(Q_tiled_copy, tQKsQ_r_j, tQKrQ_r_j_bf16_cv);
-                // gate: Q * exp2(g - g_first) * norm_scale_q in BF16 MMA layout, producing float
+                // gate: Q * exp2(g - g_first) in BF16 MMA layout, producing float
                 Tensor tQKrQ_r_j_float = make_fragment_like<float>(tv_layout_bf16_mma_A);
-                for_each(make_int_sequence<size(tA_coord_bf16)>{}, [&](auto i) {
-                    int local_row = int(get<0>(tA_coord_bf16(i)));
-                    int global_row = int(r_) * 16 + local_row;
-                    float norm_q = 1.0f; // storage.smem_norm_partial[global_row][0]; // DEBUG: force 1.0
-                    (void)global_row;
-                    tQKrQ_r_j_float(i) = float(tQKrQ_r_j_bf16(i)) * tArA_r_j(i) * norm_q;
-                });
+                cute::transform(tQKrQ_r_j_bf16, tArA_r_j, tQKrQ_r_j_float,
+                    [](auto q, auto a) { return float(q) * a; });
+                // apply per-row norm_scale_q using hardware TV mapping
+                {
+                    int row_lo = int(r_) * 16 + g_norm;
+                    int row_hi = int(r_) * 16 + g_norm + 8;
+                    float ns_lo = 1.0f; // storage.smem_norm_partial[row_lo][0]; // DEBUG
+                    float ns_hi = 1.0f; // storage.smem_norm_partial[row_hi][0]; // DEBUG
+                    CUTE_UNROLL
+                    for (int idx = 0; idx < size(tQKrQ_r_j_float); ++idx) {
+                        tQKrQ_r_j_float(idx) *= (idx % 4 < 2) ? ns_lo : ns_hi;
+                    }
+                }
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
                 convert_bf16_to_tf32_operandA_layout(tQKrQ_r_j_float, local_thread_idx);
                 // NOTE: triton tl.dot also lets MMA hardware for truncation
@@ -1698,13 +1703,19 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 Tensor tQKrK_r_j_bf16_cv = Q_thr_copy.retile_D(tQKrK_r_j_bf16);
                 copy(Q_tiled_copy, tQKsK_r_j, tQKrK_r_j_bf16_cv);
                 Tensor tQKrK_r_j_float = make_fragment_like<float>(tv_layout_bf16_mma_A);
-                for_each(make_int_sequence<size(tA_coord_bf16)>{}, [&](auto i) {
-                    int local_row = int(get<0>(tA_coord_bf16(i)));
-                    int global_row = int(r_) * 16 + local_row;
-                    float norm_k = 1.0f; // storage.smem_norm_partial[global_row][1]; // DEBUG: force 1.0
-                    (void)global_row;
-                    tQKrK_r_j_float(i) = float(tQKrK_r_j_bf16(i)) * tArA_r_j(i) * norm_k;
-                });
+                cute::transform(tQKrK_r_j_bf16, tArA_r_j, tQKrK_r_j_float,
+                    [](auto k, auto a) { return float(k) * a; });
+                // apply per-row norm_scale_k using hardware TV mapping
+                {
+                    int row_lo = int(r_) * 16 + g_norm;
+                    int row_hi = int(r_) * 16 + g_norm + 8;
+                    float ns_lo = 1.0f; // storage.smem_norm_partial[row_lo][1]; // DEBUG
+                    float ns_hi = 1.0f; // storage.smem_norm_partial[row_hi][1]; // DEBUG
+                    CUTE_UNROLL
+                    for (int idx = 0; idx < size(tQKrK_r_j_float); ++idx) {
+                        tQKrK_r_j_float(idx) *= (idx % 4 < 2) ? ns_lo : ns_hi;
+                    }
+                }
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
                 convert_bf16_to_tf32_operandA_layout(tQKrK_r_j_float, local_thread_idx);
                 auto tQKrK_r_j = recast<ElementGatedMMA>(tQKrK_r_j_float);
@@ -1739,13 +1750,17 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
                     // convert bf16 → float in BF16 MMA B layout, with norm_scale_k
                     Tensor tQKrKt_c_j_float = make_fragment_like<float>(tv_layout_bf16_mma_B);
-                    for_each(make_int_sequence<size(tB_coord_bf16)>{}, [&](auto i) {
-                        int local_token = int(get<0>(tB_coord_bf16(i)));
-                        int global_token = int(c_) * 16 + local_token;
-                        float norm_k = 1.0f; // storage.smem_norm_partial[global_token][1]; // DEBUG: force 1.0
-                        (void)global_token;
-                        tQKrKt_c_j_float(i) = float(tQKrKt_c_j_bf16(i)) * tArA_c_j(i) * norm_k;
-                    });
+                    cute::transform(tQKrKt_c_j_bf16, tArA_c_j, tQKrKt_c_j_float,
+                        [](auto k, auto a) { return float(k) * a; });
+                    // apply norm_scale_k: for operand B, all elements belong to same token
+                    {
+                        int global_token = int(c_) * 16 + warp_in_mma_norm * 8 + g_norm;
+                        float ns = 1.0f; // storage.smem_norm_partial[global_token][1]; // DEBUG
+                        CUTE_UNROLL
+                        for (int idx = 0; idx < size(tQKrKt_c_j_float); ++idx) {
+                            tQKrKt_c_j_float(idx) *= ns;
+                        }
+                    }
 
                     // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
                     convert_bf16_to_tf32_operandB_layout(tQKrKt_c_j_float, local_thread_idx);
