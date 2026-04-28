@@ -1778,7 +1778,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         cutlass::arch::NamedBarrier::arrive_and_wait(
                             NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
                         if constexpr (kNormClockProbe) {
-                            if (blockIdx.x == 0 && thread_idx_in_wg == 0)
+                            if (blockIdx.x == 0 && local_thread_idx == 0)
                                 printf("[PROBE] MathA NormReady stall: %llu cycles\n", clock64() - t_wait_start);
                         }
                         cutlass::arch::fence_view_async_shared();
