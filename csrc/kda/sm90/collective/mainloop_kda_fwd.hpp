@@ -1098,11 +1098,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     }
                 }
 
-                // Barrier 3: rsqrt values ready; cross-WG: signal MathA via NormReady
+                // Barrier 3: rsqrt values visible to Math0/1 prologue (MathA computes independently)
                 cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
-                cutlass::arch::NamedBarrier::arrive_and_wait(
-                    NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
-                cutlass::arch::fence_view_async_shared();
             }
 
             // load alpha and exp2(alpha) only once
@@ -1786,18 +1783,54 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         if constexpr (NeedsAlpha) {
                             alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
                         }
-                        // Wait for Math0/1 to finish L2 norm computation
-                        cutlass::arch::NamedBarrier::arrive_and_wait(
-                            NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
-                        cutlass::arch::fence_view_async_shared();
-                        // Cache norm scales from SMEM (multicast: multiple threads per unique row)
-                        CUTE_UNROLL
-                        for (int rn = 0; rn < 4; rn++) {
-                            cached_norm_q_lo[rn] = storage.smem_norm_partial[rn * 16 + g_norm][0];
-                            cached_norm_q_hi[rn] = storage.smem_norm_partial[rn * 16 + g_norm + 8][0];
-                            cached_norm_k_lo[rn] = storage.smem_norm_partial[rn * 16 + g_norm][1];
-                            cached_norm_k_hi[rn] = storage.smem_norm_partial[rn * 16 + g_norm + 8][1];
-                            cached_norm_kt[rn] = (warp_in_mma_norm == 0) ? cached_norm_k_lo[rn] : cached_norm_k_hi[rn];
+                        // Compute L2 norms independently in MathA (warp-level shfl reduce, no cross-WG barrier)
+                        {
+                            constexpr float kNormEps = 1e-6f;
+                            float sq_q_lo[4] = {}, sq_q_hi[4] = {};
+                            float sq_k_lo[4] = {}, sq_k_hi[4] = {};
+                            CUTE_UNROLL
+                            for (int rn = 0; rn < 4; rn++) {
+                                CUTE_UNROLL
+                                for (int jn = 0; jn < NK; jn++) {
+                                    int j0n = jn % 2, j1n = jn / 2;
+                                    Tensor sQqk_rn = sQqk_slice(_, _, rn, make_coord(j0n, j1n));
+                                    Tensor sKqk_rn = sKqk_slice(_, _, rn, make_coord(j0n, j1n));
+                                    Tensor tNrQ = make_fragment_like<Element>(tv_layout_bf16_mma_A);
+                                    copy(Q_tiled_copy, Q_thr_copy.partition_S(sQqk_rn), Q_thr_copy.retile_D(tNrQ));
+                                    CUTE_UNROLL
+                                    for (int idx = 0; idx < size(tNrQ); ++idx) {
+                                        float vq = float(tNrQ(idx));
+                                        if (idx % 4 < 2)
+                                            sq_q_lo[rn] += vq * vq;
+                                        else
+                                            sq_q_hi[rn] += vq * vq;
+                                    }
+                                    Tensor tNrK = make_fragment_like<Element>(tv_layout_bf16_mma_A);
+                                    copy(Q_tiled_copy, Q_thr_copy.partition_S(sKqk_rn), Q_thr_copy.retile_D(tNrK));
+                                    CUTE_UNROLL
+                                    for (int idx = 0; idx < size(tNrK); ++idx) {
+                                        float vk = float(tNrK(idx));
+                                        if (idx % 4 < 2)
+                                            sq_k_lo[rn] += vk * vk;
+                                        else
+                                            sq_k_hi[rn] += vk * vk;
+                                    }
+                                }
+                                sq_q_lo[rn] += __shfl_xor_sync(0xffffffff, sq_q_lo[rn], 1);
+                                sq_q_lo[rn] += __shfl_xor_sync(0xffffffff, sq_q_lo[rn], 2);
+                                sq_q_hi[rn] += __shfl_xor_sync(0xffffffff, sq_q_hi[rn], 1);
+                                sq_q_hi[rn] += __shfl_xor_sync(0xffffffff, sq_q_hi[rn], 2);
+                                sq_k_lo[rn] += __shfl_xor_sync(0xffffffff, sq_k_lo[rn], 1);
+                                sq_k_lo[rn] += __shfl_xor_sync(0xffffffff, sq_k_lo[rn], 2);
+                                sq_k_hi[rn] += __shfl_xor_sync(0xffffffff, sq_k_hi[rn], 1);
+                                sq_k_hi[rn] += __shfl_xor_sync(0xffffffff, sq_k_hi[rn], 2);
+                                cached_norm_q_lo[rn] = rsqrtf(sq_q_lo[rn] + kNormEps);
+                                cached_norm_q_hi[rn] = rsqrtf(sq_q_hi[rn] + kNormEps);
+                                cached_norm_k_lo[rn] = rsqrtf(sq_k_lo[rn] + kNormEps);
+                                cached_norm_k_hi[rn] = rsqrtf(sq_k_hi[rn] + kNormEps);
+                                cached_norm_kt[rn] =
+                                    (warp_in_mma_norm == 0) ? cached_norm_k_lo[rn] : cached_norm_k_hi[rn];
+                            }
                         }
                     }
 
@@ -1967,18 +2000,53 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 if constexpr (NeedsAlpha) {
                     alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
                 }
-                // Wait for Math0/1 to finish L2 norm computation
-                cutlass::arch::NamedBarrier::arrive_and_wait(
-                    NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
-                cutlass::arch::fence_view_async_shared();
-                // Cache norm scales from SMEM (multicast: multiple threads per unique row)
-                CUTE_UNROLL
-                for (int rn = 0; rn < 4; rn++) {
-                    cached_norm_q_lo[rn] = storage.smem_norm_partial[rn * 16 + g_norm][0];
-                    cached_norm_q_hi[rn] = storage.smem_norm_partial[rn * 16 + g_norm + 8][0];
-                    cached_norm_k_lo[rn] = storage.smem_norm_partial[rn * 16 + g_norm][1];
-                    cached_norm_k_hi[rn] = storage.smem_norm_partial[rn * 16 + g_norm + 8][1];
-                    cached_norm_kt[rn] = (warp_in_mma_norm == 0) ? cached_norm_k_lo[rn] : cached_norm_k_hi[rn];
+                // Compute L2 norms independently in MathA (warp-level shfl reduce, no cross-WG barrier)
+                {
+                    constexpr float kNormEps = 1e-6f;
+                    float sq_q_lo[4] = {}, sq_q_hi[4] = {};
+                    float sq_k_lo[4] = {}, sq_k_hi[4] = {};
+                    CUTE_UNROLL
+                    for (int rn = 0; rn < 4; rn++) {
+                        CUTE_UNROLL
+                        for (int jn = 0; jn < NK; jn++) {
+                            int j0n = jn % 2, j1n = jn / 2;
+                            Tensor sQqk_rn = sQqk_slice(_, _, rn, make_coord(j0n, j1n));
+                            Tensor sKqk_rn = sKqk_slice(_, _, rn, make_coord(j0n, j1n));
+                            Tensor tNrQ = make_fragment_like<Element>(tv_layout_bf16_mma_A);
+                            copy(Q_tiled_copy, Q_thr_copy.partition_S(sQqk_rn), Q_thr_copy.retile_D(tNrQ));
+                            CUTE_UNROLL
+                            for (int idx = 0; idx < size(tNrQ); ++idx) {
+                                float vq = float(tNrQ(idx));
+                                if (idx % 4 < 2)
+                                    sq_q_lo[rn] += vq * vq;
+                                else
+                                    sq_q_hi[rn] += vq * vq;
+                            }
+                            Tensor tNrK = make_fragment_like<Element>(tv_layout_bf16_mma_A);
+                            copy(Q_tiled_copy, Q_thr_copy.partition_S(sKqk_rn), Q_thr_copy.retile_D(tNrK));
+                            CUTE_UNROLL
+                            for (int idx = 0; idx < size(tNrK); ++idx) {
+                                float vk = float(tNrK(idx));
+                                if (idx % 4 < 2)
+                                    sq_k_lo[rn] += vk * vk;
+                                else
+                                    sq_k_hi[rn] += vk * vk;
+                            }
+                        }
+                        sq_q_lo[rn] += __shfl_xor_sync(0xffffffff, sq_q_lo[rn], 1);
+                        sq_q_lo[rn] += __shfl_xor_sync(0xffffffff, sq_q_lo[rn], 2);
+                        sq_q_hi[rn] += __shfl_xor_sync(0xffffffff, sq_q_hi[rn], 1);
+                        sq_q_hi[rn] += __shfl_xor_sync(0xffffffff, sq_q_hi[rn], 2);
+                        sq_k_lo[rn] += __shfl_xor_sync(0xffffffff, sq_k_lo[rn], 1);
+                        sq_k_lo[rn] += __shfl_xor_sync(0xffffffff, sq_k_lo[rn], 2);
+                        sq_k_hi[rn] += __shfl_xor_sync(0xffffffff, sq_k_hi[rn], 1);
+                        sq_k_hi[rn] += __shfl_xor_sync(0xffffffff, sq_k_hi[rn], 2);
+                        cached_norm_q_lo[rn] = rsqrtf(sq_q_lo[rn] + kNormEps);
+                        cached_norm_q_hi[rn] = rsqrtf(sq_q_hi[rn] + kNormEps);
+                        cached_norm_k_lo[rn] = rsqrtf(sq_k_lo[rn] + kNormEps);
+                        cached_norm_k_hi[rn] = rsqrtf(sq_k_hi[rn] + kNormEps);
+                        cached_norm_kt[rn] = (warp_in_mma_norm == 0) ? cached_norm_k_lo[rn] : cached_norm_k_hi[rn];
+                    }
                 }
 
                 // for loop head dim
