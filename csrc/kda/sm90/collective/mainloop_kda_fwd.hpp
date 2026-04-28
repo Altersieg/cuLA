@@ -48,12 +48,13 @@ struct KdaNamedBarriers : FlatSharedNamedBarriers {
     // used for subchunk MMA with two groups, each group has 2 warps
     // static constexpr int AuxMathWarp0 = FlatSharedNamedBarriers::NumBarriersUsed + 3;
     // static constexpr int AuxMathWarp1 = FlatSharedNamedBarriers::NumBarriersUsed + 4;
-    // L2norm barrier: use CUTLASS developer API (ReservedNamedBarriers enum type)
+    // L2norm barriers: use CUTLASS developer API (ReservedNamedBarriers enum type)
     // to get effective barrier IDs WITHOUT the +8 user offset.
-    // TmemAllocBarrier(=6) is unused on SM90 Hopper.
-    //   NormExchange: Math0/1 internal sync (256 threads) for zero-init, accumulate, rsqrt
-    //   MathA computes its own norm independently via warp-level shfl reduce (no cross-WG barrier).
-    static constexpr auto NormExchange = cutlass::arch::ReservedNamedBarriers::TmemAllocBarrier;  // eff 6
+    // TmemAllocBarrier(=6) and Sm120MainloopBarrier(=7) are unused on SM90 Hopper.
+    //   NormExchange: Math0/1 internal sync (256 threads) for warp-reduce partial sums and rsqrt
+    //   NormReady: cross-WG sync (256 Math0/1 + 128 MathA); signals MathA that smem_norm_partial is ready
+    static constexpr auto NormExchange = cutlass::arch::ReservedNamedBarriers::TmemAllocBarrier;   // eff 6
+    static constexpr auto NormReady = cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier;  // eff 7
 };
 
 using ku::alignment_for_swizzle;
