@@ -1031,74 +1031,53 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             k_pipeline.consumer_wait(k_smem_pipe_read);
 
             // ========================================================
-            // L2Norm: warp-reduce (no atomicAdd, 2 NormExchange barriers, then NormReady)
-            // Assumption: all elements of each thread's fragment share the same tok_q row
-            // (valid for TileShapeQK_Quar=(64,64,32): 2 threads/row × 16 K-elems/thread = 32K ✓)
+            // L2Norm: compute per-row rsqrt(||q||^2 + eps) and rsqrt(||k||^2 + eps)
+            // Runs for ALL blocks (including first). Results in smem_norm_partial.
             // ========================================================
             {
-                constexpr float kNormEps = 1e-6f;
                 int wg_idx = thread_idx / 128;  // 0 or 1
-                int thread_idx_in_wg = thread_idx % 128;
                 auto tQKrQ_wg = qk_thr_mma_rs_quar.partition_fragment_A(sQqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
                 auto tQKrK_wg = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
 
-                // Phase 1: local register accumulation across both s-slices (no SMEM access)
-                float local_sq_q = 0.0f, local_sq_k = 0.0f;
+                // Zero-init SMEM norm accumulators
+                for (int i = thread_idx; i < 128; i += NumStateMmaThreads) {
+                    int row = i / 2, qk = i % 2;
+                    storage.smem_norm_partial[row][qk] = 0.0f;
+                }
+                cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
+
+                // Accumulate squares: 2 slices × 32 head_dim per WG
                 for (int s = 0; s < 2; ++s) {
                     auto sQqk_cur = sQqk_slice(_, _, _0{}, make_coord(s, wg_idx));
-                    copy(
-                        tiled_load_qk_quar,
-                        thr_load_qk_quar.partition_S(sQqk_cur),
-                        thr_load_qk_quar.retile_D(tQKrQ_wg));
+                    auto tQKsQ_cur = thr_load_qk_quar.partition_S(sQqk_cur);
+                    auto tQKrQ_cv = thr_load_qk_quar.retile_D(tQKrQ_wg);
+                    copy(tiled_load_qk_quar, tQKsQ_cur, tQKrQ_cv);
                     for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
-                        local_sq_q += float(tQKrQ_wg(i)) * float(tQKrQ_wg(i));
+                        int row = int(get<0>(tQcMq_quar(i)));
+                        float v = float(tQKrQ_wg(i));
+                        atomicAdd(&storage.smem_norm_partial[row][0], v * v);
                     });
 
                     auto sKqk_cur = sKqk_slice(_, _, _0{}, make_coord(s, wg_idx));
-                    copy(
-                        tiled_load_qk_quar,
-                        thr_load_qk_quar.partition_S(sKqk_cur),
-                        thr_load_qk_quar.retile_D(tQKrK_wg));
+                    auto tQKsK_cur = thr_load_qk_quar.partition_S(sKqk_cur);
+                    auto tQKrK_cv = thr_load_qk_quar.retile_D(tQKrK_wg);
+                    copy(tiled_load_qk_quar, tQKsK_cur, tQKrK_cv);
                     for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
-                        local_sq_k += float(tQKrK_wg(i)) * float(tQKrK_wg(i));
+                        int row = int(get<0>(tQcMq_quar(i)));
+                        float v = float(tQKrK_wg(i));
+                        atomicAdd(&storage.smem_norm_partial[row][1], v * v);
                     });
                 }
 
-                // Phase 2: 2-way warp reduce (adjacent lane pairs share same tok_q row)
-                local_sq_q += __shfl_xor_sync(0xffffffff, local_sq_q, 1);
-                local_sq_k += __shfl_xor_sync(0xffffffff, local_sq_k, 1);
-
-                int row = int(get<0>(tQcMq_quar(_0{})));
-                int lane_id = thread_idx % 32;
-
-                // Step A: WG0 even-lane threads write partial sums into smem_norm_partial
-                if (wg_idx == 0 && lane_id % 2 == 0) {
-                    storage.smem_norm_partial[row][0] = local_sq_q;
-                    storage.smem_norm_partial[row][1] = local_sq_k;
-                }
-
-                // Barrier 1: WG0 partials visible to all 256 Math0/1 threads
                 cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
-
-                // Step B: WG1 even-lane threads: read WG0 partial, add own, write back
-                // (atomic-free: WG0 done, each thread writes a unique row, no aliasing)
-                if (wg_idx == 1 && lane_id % 2 == 0) {
-                    storage.smem_norm_partial[row][0] = storage.smem_norm_partial[row][0] + local_sq_q;
-                    storage.smem_norm_partial[row][1] = storage.smem_norm_partial[row][1] + local_sq_k;
+                // Compute rsqrt
+                constexpr float kNormEps = 1e-6f;
+                for (int i = thread_idx; i < 128; i += NumStateMmaThreads) {
+                    int row = i / 2, qk = i % 2;
+                    float sq_sum = storage.smem_norm_partial[row][qk];
+                    storage.smem_norm_partial[row][qk] = rsqrtf(sq_sum + kNormEps);
                 }
 
-                // Barrier 2: combined partial sums visible to all
-                cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
-
-                // Step C: WG0 threads 0..63 compute rsqrt, overwrite partial with scale
-                if (wg_idx == 0) {
-                    for (int r = thread_idx_in_wg; r < 64; r += 128) {
-                        storage.smem_norm_partial[r][0] = rsqrtf(storage.smem_norm_partial[r][0] + kNormEps);
-                        storage.smem_norm_partial[r][1] = rsqrtf(storage.smem_norm_partial[r][1] + kNormEps);
-                    }
-                }
-
-                // Barrier 3: rsqrt values visible to Math0/1 prologue (MathA computes independently)
                 cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
             }
 
