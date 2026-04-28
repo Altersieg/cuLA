@@ -451,8 +451,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         // store last row in Alpha separately, used for S'=K^T NewV's epilogue and S+=decay(S') (one fused epilogue)
         cute::array_aligned<ElementAlpha, cute::cosize_v<SmemLayoutAlphaLast>> smem_alpha_last;
         // l2norm: scratch buffer for WG partial sums, then overwritten with rsqrt scales
-        // layout: [max_tokens (64), 2 (Q/K)]
-        alignas(16) float smem_norm_partial[64][2];
+        // layout: [max_tokens (64), 3 (Q/K + 1 pad)]; stride=3 coprime to 32 → bank-conflict-free
+        alignas(16) float smem_norm_partial[64][3];
     };
 
     using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
