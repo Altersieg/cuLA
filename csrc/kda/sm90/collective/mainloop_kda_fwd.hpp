@@ -1035,6 +1035,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             // Runs for ALL blocks (including first). Results in smem_norm_partial.
             // ========================================================
             {
+                constexpr bool kNormClockProbe = false;  // set true to measure norm timing
+                uint64_t t_norm_start = kNormClockProbe ? clock64() : 0;
                 int wg_idx = thread_idx / 128;  // 0 or 1
                 auto tQKrQ_wg = qk_thr_mma_rs_quar.partition_fragment_A(sQqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
                 auto tQKrK_wg = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
@@ -1083,6 +1085,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 // Barrier 3: rsqrt values ready; cross-WG: signal MathA via NormReady
                 cutlass::arch::NamedBarrier::arrive_and_wait(
                     NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
+                if constexpr (kNormClockProbe) {
+                    if (blockIdx.x == 0 && thread_idx == 0)
+                        printf("[PROBE] Math0/1 norm total: %llu cycles\n", clock64() - t_norm_start);
+                }
             }
 
             // load alpha and exp2(alpha) only once
@@ -1767,8 +1773,14 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                             alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
                         }
                         // Wait for Math0/1 to finish L2 norm computation
+                        constexpr bool kNormClockProbe = false;  // set true to measure NormReady stall
+                        uint64_t t_wait_start = kNormClockProbe ? clock64() : 0;
                         cutlass::arch::NamedBarrier::arrive_and_wait(
                             NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
+                        if constexpr (kNormClockProbe) {
+                            if (blockIdx.x == 0 && thread_idx_in_wg == 0)
+                                printf("[PROBE] MathA NormReady stall: %llu cycles\n", clock64() - t_wait_start);
+                        }
                         cutlass::arch::fence_view_async_shared();
                         // Cache norm scales from SMEM (multicast: multiple threads per unique row)
                         CUTE_UNROLL
