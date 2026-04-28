@@ -1034,7 +1034,9 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             // L2Norm: compute per-row rsqrt(||q||^2 + eps) and rsqrt(||k||^2 + eps)
             // Runs for ALL blocks (including first). Results in smem_norm_partial.
             // ========================================================
-            {
+            // ABLATION: set true to skip Math0/1 norm compute (results will be wrong, timing only)
+            constexpr bool kSkipNormCompute = false;
+            if constexpr (!kSkipNormCompute) {
                 int wg_idx = thread_idx / 128;  // 0 or 1
                 auto tQKrQ_wg = qk_thr_mma_rs_quar.partition_fragment_A(sQqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
                 auto tQKrK_wg = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
