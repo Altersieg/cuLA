@@ -450,12 +450,9 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         cute::array_aligned<ElementBeta, cute::cosize_v<SmemLayoutBeta>> smem_beta;
         // store last row in Alpha separately, used for S'=K^T NewV's epilogue and S+=decay(S') (one fused epilogue)
         cute::array_aligned<ElementAlpha, cute::cosize_v<SmemLayoutAlphaLast>> smem_alpha_last;
-        // l2norm: final rsqrt values after warp-reduce, read by MathA after NormReady
+        // l2norm: scratch buffer for WG partial sums, then overwritten with rsqrt scales
         // layout: [max_tokens (64), 2 (Q/K)]
         alignas(16) float smem_norm_partial[64][2];
-        // l2norm: per-WG partial sums for warp-reduce (stride-3 padding: bank-conflict-free)
-        // layout: [2 (wg_idx), 64 (row), 3 (Q/K/pad)]
-        alignas(16) float smem_norm_buf[2][64][3];
     };
 
     using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
@@ -1071,28 +1068,37 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 local_sq_q += __shfl_xor_sync(0xffffffff, local_sq_q, 1);
                 local_sq_k += __shfl_xor_sync(0xffffffff, local_sq_k, 1);
 
-                // Phase 3: even-lane writes per-WG partial sum (bank-conflict-free: stride-3 layout)
                 int row = int(get<0>(tQcMq_quar(_0{})));
                 int lane_id = thread_idx % 32;
-                if (lane_id % 2 == 0) {
-                    storage.smem_norm_buf[wg_idx][row][0] = local_sq_q;
-                    storage.smem_norm_buf[wg_idx][row][1] = local_sq_k;
+
+                // Step A: WG0 even-lane threads write partial sums into smem_norm_partial
+                if (wg_idx == 0 && lane_id % 2 == 0) {
+                    storage.smem_norm_partial[row][0] = local_sq_q;
+                    storage.smem_norm_partial[row][1] = local_sq_k;
                 }
 
-                // Barrier 1: wait for all WG partial writes to be visible
+                // Barrier 1: WG0 partials visible to all 256 Math0/1 threads
                 cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
 
-                // Phase 4: WG0 finalizes (threads 0..63 each handle 1 row, WG1 idles)
+                // Step B: WG1 even-lane threads: read WG0 partial, add own, write back
+                // (atomic-free: WG0 done, each thread writes a unique row, no aliasing)
+                if (wg_idx == 1 && lane_id % 2 == 0) {
+                    storage.smem_norm_partial[row][0] = storage.smem_norm_partial[row][0] + local_sq_q;
+                    storage.smem_norm_partial[row][1] = storage.smem_norm_partial[row][1] + local_sq_k;
+                }
+
+                // Barrier 2: combined partial sums visible to all
+                cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
+
+                // Step C: WG0 threads 0..63 compute rsqrt, overwrite partial with scale
                 if (wg_idx == 0) {
                     for (int r = thread_idx_in_wg; r < 64; r += 128) {
-                        float sq_q = storage.smem_norm_buf[0][r][0] + storage.smem_norm_buf[1][r][0];
-                        float sq_k = storage.smem_norm_buf[0][r][1] + storage.smem_norm_buf[1][r][1];
-                        storage.smem_norm_partial[r][0] = rsqrtf(sq_q + kNormEps);
-                        storage.smem_norm_partial[r][1] = rsqrtf(sq_k + kNormEps);
+                        storage.smem_norm_partial[r][0] = rsqrtf(storage.smem_norm_partial[r][0] + kNormEps);
+                        storage.smem_norm_partial[r][1] = rsqrtf(storage.smem_norm_partial[r][1] + kNormEps);
                     }
                 }
 
-                // Barrier 2: rsqrt values visible to all; cross-WG: signal MathA via NormReady
+                // Barrier 3: rsqrt values ready; cross-WG: signal MathA via NormReady
                 cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::NormExchange);
                 cutlass::arch::NamedBarrier::arrive_and_wait(
                     NumStateMmaThreads + NumAuxMmaThreads, KdaNamedBarriers::NormReady);
